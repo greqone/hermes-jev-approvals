@@ -488,12 +488,15 @@ def _tag_error(exc: Exception, *, attempts: int = 0, status_code: Optional[int] 
     return exc
 
 
-def _post(base_url: str, body: Dict[str, Any], timeout: float) -> Dict[str, Any]:
+def _post(base_url: str, body: Dict[str, Any], timeout: float,
+          deadline: Optional[float] = None) -> Dict[str, Any]:
     """POST with bounded retries on transient failures only.
 
     ponytail: stdlib urllib + a loop, no new dependency. Retries 429/529/5xx and network
     errors under one overall deadline — not `_MAX_ATTEMPTS * timeout`, because this call
-    blocks the agent's turn while a human waits.
+    blocks the agent's turn while a human waits. A caller that resends (context-cap
+    reductions) passes its own absolute monotonic *deadline* so every request shares
+    one budget instead of each starting a fresh one.
     """
     # The credential boundary first: no URL is built, no key is resolved and no
     # connection is opened until base_url has passed it.
@@ -502,7 +505,8 @@ def _post(base_url: str, body: Dict[str, Any], timeout: float) -> Dict[str, Any]
     url = base_url.rstrip("/") + endpoint if endpoint else base_url
     data = json.dumps(body).encode()
     key = _api_key(base_url)
-    deadline = time.monotonic() + min(_DEADLINE_S, max(timeout, 5.0))
+    if deadline is None:
+        deadline = _deadline_for(timeout)
     last: Exception = RuntimeError(f"{PROVIDER_NAME}: no attempt made")
 
     for attempt in range(1, _MAX_ATTEMPTS + 1):
@@ -559,6 +563,11 @@ def _post(base_url: str, body: Dict[str, Any], timeout: float) -> Dict[str, Any]
                 break
             time.sleep(delay)
     raise last
+
+
+def _deadline_for(timeout: float) -> float:
+    """Absolute monotonic deadline for one judgement, retries included."""
+    return time.monotonic() + min(_DEADLINE_S, max(timeout, 5.0))
 
 
 def _http_hint(code: int) -> str:
@@ -922,6 +931,9 @@ class JevClient:
             redacted_command = _redact(command)
             safe_description = _redact(description)[:500] if description else ""
             cap = _command_cap()
+            # One budget for the whole judgement: cap reductions must not each restart it.
+            deadline = _deadline_for(timeout or self._timeout)
+            prior_attempts = 0
             while True:
                 safe_command, truncated = _truncate(redacted_command, cap)
                 row.update(command=safe_command[:600], flagged_as=safe_description or None,
@@ -936,21 +948,24 @@ class JevClient:
                 try:
                     data = _post(self.base_url, {"state": state, "model": model_id,
                                                  "questions": QUESTIONS},
-                                 timeout or self._timeout)
+                                 timeout or self._timeout, deadline=deadline)
                     break
                 except RuntimeError as exc:
+                    attempts = prior_attempts + int(getattr(exc, "attempts", 0) or 0)
+                    setattr(exc, "attempts", attempts)
                     if (getattr(exc, "error_class", "") != "max_tokens_exceeded"
                             or cap <= _MIN_COMMAND_CHARS):
                         raise
+                    prior_attempts = attempts
                     cap = max(_MIN_COMMAND_CHARS, cap // 2)
                     logger.info("%s: command over Jev context, resending capped at %d chars",
                                 PROVIDER_NAME, cap)
             if not isinstance(data, dict):
-                row["attempts"], row["http_status"] = 1, 200
+                row["attempts"], row["http_status"] = prior_attempts + 1, 200
                 raise RuntimeError(f"{PROVIDER_NAME}: response is a {type(data).__name__}, not "
                                    f"an answers object; escalating")
             transport = data.pop(_TRANSPORT_KEY, {})
-            row.update(attempts=int(transport.get("attempts") or 1),
+            row.update(attempts=prior_attempts + int(transport.get("attempts") or 1),
                        http_status=transport.get("http_status", 200),
                        request_id=transport.get("request_id"))
             answers = data.get("answers")

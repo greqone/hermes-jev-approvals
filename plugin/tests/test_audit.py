@@ -117,7 +117,7 @@ def read_rows(path=None):
 
 def stub_post(payload=None, exc=None, transport=None):
     """A client-boundary _post: fills the transport stash the way the real one does."""
-    def _post(base_url, body, timeout):
+    def _post(base_url, body, timeout, deadline=None):
         if exc is not None:
             raise exc
         data = {"answers": payload if payload is not None else FULL, "model": "jev-1.13.0",

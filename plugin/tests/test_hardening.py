@@ -45,7 +45,7 @@ FULL = {"verdict": {"choice": "APPROVE", "confidence": 0.9},
 
 
 def fake_post(answers, calls=None):
-    def _post(base_url, body, timeout):
+    def _post(base_url, body, timeout, deadline=None):
         if calls is not None:
             calls.append(body)
         return {"answers": answers, "model": "jev-1.13.0",

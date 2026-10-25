@@ -34,7 +34,7 @@ def ask(command):
 
 # 1. A ~20k-char script — five times the old 4000 cap — goes out whole and can be APPROVEd.
 sent = []
-def ok_post(base_url, body, timeout):
+def ok_post(base_url, body, timeout, deadline=None):
     sent.append(len(body["state"]["command"]))
     return {"answers": FULL, "model": "jev-1.13.0", "usage": {}}
 jev._post = ok_post
@@ -66,7 +66,7 @@ print("2. 400 max_tokens_exceeded classified, not retried               ok")
 
 # 3. Over context: halve and resend, and a cut command still can never be APPROVEd.
 sizes = []
-def shrinking_post(base_url, body, timeout):
+def shrinking_post(base_url, body, timeout, deadline=None):
     n = len(body["state"]["command"])
     sizes.append(n)
     if n > 20000:
@@ -84,7 +84,7 @@ print(f"3. over-context command shrunk {sizes} -> ESCALATE         ok")
 
 # 4. At the floor, a further max_tokens_exceeded raises (core escalates) — no infinite loop.
 sizes.clear()
-def always_too_big(base_url, body, timeout):
+def always_too_big(base_url, body, timeout, deadline=None):
     sizes.append(len(body["state"]["command"]))
     err = RuntimeError("Jev: HTTP 400 (state over Jev context)")
     jev._tag_error(err, attempts=1, status_code=400, error_class="max_tokens_exceeded")
@@ -97,3 +97,48 @@ except RuntimeError:
     pass
 assert len(sizes) == 3, sizes
 print("4. floor reached -> raises, core escalates                       ok")
+
+# 5. Cap reductions share ONE deadline and the audit row counts every HTTP attempt.
+timeouts, budget = [], []
+def slow_shrinking_post(base_url, body, timeout, deadline=None):
+    timeouts.append(timeout)
+    budget.append(deadline)
+    n = len(body["state"]["command"])
+    if n > 20000:
+        err = RuntimeError("Jev: HTTP 400 (state over Jev context)")
+        jev._tag_error(err, attempts=2, status_code=400, error_class="max_tokens_exceeded")
+        raise err
+    return {"answers": FULL, "model": "jev-1.13.0", "usage": {},
+            jev._TRANSPORT_KEY: {"attempts": 1, "http_status": 200, "request_id": "r"}}
+jev._post = slow_shrinking_post
+assert ask(huge) == "ESCALATE"
+assert len(budget) == 3 and budget[0] is not None and len(set(budget)) == 1, budget
+row = json.loads(pathlib.Path(os.environ["JEV_APPROVAL_LOG"]).read_text().splitlines()[-1])
+assert row["attempts"] == 5, row["attempts"]
+print("5. one deadline across cap reductions, attempts summed (5)          ok")
+
+# 6. Failure rows also count every attempt across reductions.
+def always_too_big2(base_url, body, timeout, deadline=None):
+    err = RuntimeError("Jev: HTTP 400 (state over Jev context)")
+    jev._tag_error(err, attempts=1, status_code=400, error_class="max_tokens_exceeded")
+    raise err
+jev._post = always_too_big2
+try:
+    ask(huge)
+    raise AssertionError("must raise at the floor")
+except RuntimeError:
+    pass
+row = json.loads(pathlib.Path(os.environ["JEV_APPROVAL_LOG"]).read_text().splitlines()[-1])
+assert row["ok"] is False and row["attempts"] == 3, row
+print("6. failure row counts all 3 attempts                             ok")
+
+# 7. _post honours a shared deadline that has already passed: no request is sent.
+calls["n"] = 0
+jev2._urlopen = opener
+try:
+    jev2._post("https://api.typesafe.ai/v1", {"state": {}}, 30.0, deadline=jev2.time.monotonic() - 1)
+    raise AssertionError("expired deadline must raise")
+except RuntimeError:
+    pass
+assert calls["n"] == 0, calls
+print("7. expired shared deadline -> no request                         ok")
